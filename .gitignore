@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.local
+
+# Lock files (keep pnpm-lock.yaml)
+package-lock.json
+
+# Temporary
+*.tmp
+*.log
+
+# Local config (user-specific)
+src-tauri/icons/*.png
+!src-tauri/icons/32x32.png
+!src-tauri/icons/64x64.png
+!src-tauri/icons/128x128.png
+!src-tauri/icons/128x128@2x.png
+!src-tauri/icons/icon.ico
+
+# Reference repos
+cc-switch/
+
+# Local tool configs
+.aionrs/
+.claude/
+
+# Local scripts
+start.bat
+
+# Internal docs
+PROCESS_EXIT_ISSUE.md
+readme_update.md
