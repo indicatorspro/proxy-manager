@@ -1,4 +1,5 @@
 use crate::services::backend_types::*;
+use crate::services::job_object::JobObject;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -6,9 +7,15 @@ use tokio::process::{Child, Command};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
+struct ManagedChild {
+    child: Child,
+    #[allow(dead_code)]
+    job_object: Option<JobObject>,
+}
+
 pub struct BackendRuntime {
     backends: Arc<RwLock<HashMap<String, ManagedBackend>>>,
-    children: Arc<RwLock<HashMap<String, Child>>>,
+    children: Arc<RwLock<HashMap<String, ManagedChild>>>,
     logs: Arc<RwLock<HashMap<String, Vec<String>>>>,
     config_path: std::path::PathBuf,
 }
@@ -209,9 +216,38 @@ impl BackendRuntime {
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::piped());
 
+        let mut job_object = None;
+
+        #[cfg(target_os = "windows")]
+        {
+            match JobObject::new() {
+                Ok(job) => {
+                    job_object = Some(job);
+                }
+                Err(e) => {
+                    eprintln!("[PROXY-MANAGER] Failed to create Job Object: {}", e);
+                }
+            }
+        }
+
+        #[cfg(target_os = "unix")]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn process: {e}"))?;
         let pid = child.id();
         eprintln!("[PROXY-MANAGER] start() spawned pid={pid:?} id={backend_id} command={command}");
+
+        #[cfg(target_os = "windows")]
+        if let Some(ref job) = job_object {
+            if let Some(handle) = child.raw_handle() {
+                if let Err(e) = job.assign_process(handle as isize) {
+                    eprintln!("[PROXY-MANAGER] Failed to assign process to Job Object: {}", e);
+                }
+            }
+        }
 
         let stdout_notify = Arc::new(tokio::sync::Notify::new());
         let stderr_notify = Arc::new(tokio::sync::Notify::new());
@@ -287,7 +323,7 @@ impl BackendRuntime {
         }
 
         let mut children = self.children.write().await;
-        children.insert(backend_id.clone(), child);
+        children.insert(backend_id.clone(), ManagedChild { child, job_object });
 
         let mut backends = self.backends.write().await;
         if let Some(backend) = backends.get_mut(&backend_id) {
@@ -329,19 +365,34 @@ impl BackendRuntime {
 
     pub async fn stop(&self, id: &str) -> Result<ManagedBackend, String> {
         eprintln!("[PROXY-MANAGER] stop() called for id={id}");
-        let child = {
+        let managed_child = {
             let mut children = self.children.write().await;
             let found = children.contains_key(id);
             eprintln!("[PROXY-MANAGER] stop() child in map: {found}");
             children.remove(id)
         };
 
-        if let Some(mut child) = child {
+        if let Some(managed) = managed_child {
+            let mut child = managed.child;
             eprintln!("[PROXY-MANAGER] stop() killing child pid={:?}", child.id());
+
+            // No Unix, kill the entire process group
+            #[cfg(target_os = "unix")]
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::killpg(pid as i32, libc::SIGTERM);
+                }
+                // Give it a moment to terminate gracefully
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
             let kill_result = child.kill().await;
             eprintln!("[PROXY-MANAGER] stop() kill result: {:?}", kill_result);
             let wait_result = child.wait().await;
             eprintln!("[PROXY-MANAGER] stop() wait result: {:?}", wait_result);
+
+            // Job object will be dropped here, which closes the handle and kills all processes in the job
+            drop(managed.job_object);
         } else {
             eprintln!("[PROXY-MANAGER] stop() NO child found in map");
         }
@@ -377,8 +428,8 @@ impl BackendRuntime {
 
     pub async fn send_input(&self, id: &str, input: &str) -> Result<ManagedBackend, String> {
         let mut children = self.children.write().await;
-        if let Some(child) = children.get_mut(id) {
-            if let Some(stdin) = child.stdin.as_mut() {
+        if let Some(managed) = children.get_mut(id) {
+            if let Some(stdin) = managed.child.stdin.as_mut() {
                 stdin.write_all(input.as_bytes()).await.map_err(|e| e.to_string())?;
                 if !input.ends_with('\n') && !input.ends_with('\r') {
                     #[cfg(target_os = "windows")]
@@ -531,7 +582,7 @@ impl BackendRuntime {
                     let exited = {
                         let mut children = runtime.children.write().await;
                         match children.get_mut(backend_id) {
-                            Some(child) => match child.try_wait() {
+                            Some(managed) => match managed.child.try_wait() {
                                 Ok(Some(status)) => {
                                     eprintln!("[PROXY-MANAGER] watch_process try_wait=Some({status})");
                                     children.remove(backend_id);
@@ -635,14 +686,16 @@ impl BackendRuntime {
     }
 
     pub async fn stop_all(&self) {
-        let children: Vec<Child> = {
+        let managed_children: Vec<ManagedChild> = {
             let mut map = self.children.write().await;
-            map.drain().map(|(_, child)| child).collect()
+            map.drain().map(|(_, managed)| managed).collect()
         };
 
-        for mut child in children {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        for mut managed in managed_children {
+            let _ = managed.child.kill().await;
+            let _ = managed.child.wait().await;
+            // Job object will be dropped here, killing all processes in the job
+            drop(managed.job_object);
         }
 
         let mut backends = self.backends.write().await;
